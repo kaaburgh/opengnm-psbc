@@ -69,6 +69,19 @@ convert_pointer_to_64_bit(nir_builder *b, lower_descriptors_state *state, nir_de
 }
 
 static nir_def *
+convert_buffer_pointer_to_64_bit(nir_builder *b, lower_descriptors_state *state, nir_def *ptr, unsigned set)
+{
+   const struct ac_arg descriptor_arg = state->args->descriptors[set];
+
+   if (descriptor_arg.used && state->args->ac.args[descriptor_arg.arg_index].size == 2) {
+      nir_def *descriptor_ptr = get_scalar_arg(b, 2, descriptor_arg);
+      return nir_pack_64_2x32_split(b, ptr, nir_channel(b, descriptor_ptr, 1));
+   }
+
+   return convert_pointer_to_64_bit(b, state, ptr);
+}
+
+static nir_def *
 get_dynamic_descriptors_offset(nir_builder *b, lower_descriptors_state *state, uint32_t desc_set, uint32_t binding)
 {
    struct radv_descriptor_set_layout *layout = state->layout->set[desc_set].layout;
@@ -103,7 +116,15 @@ load_desc_ptr(nir_builder *b, lower_descriptors_state *state, unsigned set)
    }
 
    assert(state->args->descriptors[set].used);
-   return get_scalar_arg(b, 1, state->args->descriptors[set]);
+   const struct ac_arg arg = state->args->descriptors[set];
+
+   /* A two-SGPR descriptor-set argument is a full 64-bit pointer. The set
+    * pointer in a resource index stays the low half; descriptor loads take
+    * the high half from the argument (convert_buffer_pointer_to_64_bit). */
+   if (state->args->ac.args[arg.arg_index].size == 2)
+      return nir_channel(b, get_scalar_arg(b, 2, arg), 0);
+
+   return get_scalar_arg(b, 1, arg);
 }
 
 static nir_def *
@@ -240,7 +261,13 @@ load_buffer_descriptor(nir_builder *b, lower_descriptors_state *state, nir_def *
    if (access & ACCESS_NON_UNIFORM)
       return nir_iadd(b, nir_channel(b, rsrc, 0), nir_channel(b, rsrc, 1));
 
-   nir_def *desc_set = convert_pointer_to_64_bit(b, state, nir_channel(b, rsrc, 0));
+   /* visit_vulkan_resource_index() may already have lowered the binding
+    * tuple, in which case nir_chase_binding() can no longer recover the
+    * original set. Standalone psbc supports only set 0, so use that as the
+    * fallback. One-SGPR RADV arguments still use address32_hi below. */
+   const unsigned descriptor_set = binding.success ? binding.desc_set : 0;
+   nir_def *desc_set =
+      convert_buffer_pointer_to_64_bit(b, state, nir_channel(b, rsrc, 0), descriptor_set);
    return ac_nir_load_smem(b, 4, desc_set, nir_channel(b, rsrc, 1), 4, 0);
 }
 
@@ -248,15 +275,19 @@ static void
 visit_ssbo_descriptor_amd(nir_builder *b, lower_descriptors_state *state, nir_intrinsic_instr *intrin)
 {
    nir_def *rsrc = intrin->src[0].ssa;
+   nir_binding binding = nir_chase_binding(nir_src_for_ssa(rsrc));
    nir_def *desc;
 
    if (nir_intrinsic_access(intrin) & ACCESS_NON_UNIFORM) {
       nir_def *ptr = nir_iadd(b, nir_channel(b, rsrc, 0), nir_channel(b, rsrc, 1));
-      ptr = convert_pointer_to_64_bit(b, state, ptr);
+      const unsigned descriptor_set = binding.success ? binding.desc_set : 0;
+      ptr = convert_buffer_pointer_to_64_bit(b, state, ptr, descriptor_set);
       desc = nir_load_global(b, 4, 32, ptr, .access = ACCESS_NON_WRITEABLE | ACCESS_CAN_REORDER, .align_mul = 16);
    } else {
       /* load the entire descriptor so it can be CSE'd */
-      nir_def *ptr = convert_pointer_to_64_bit(b, state, nir_channel(b, rsrc, 0));
+      const unsigned descriptor_set = binding.success ? binding.desc_set : 0;
+      nir_def *ptr = convert_buffer_pointer_to_64_bit(
+         b, state, nir_channel(b, rsrc, 0), descriptor_set);
       desc = ac_nir_load_smem(b, 4, ptr, nir_channel(b, rsrc, 1), 4, 0);
    }
 

@@ -51,6 +51,7 @@ allocate_inline_push_consts(const struct radv_shader_info *info, struct user_sgp
 struct radv_shader_args_state {
    struct radv_shader_args *args;
    bool gather_debug_info;
+   bool full_64bit_descriptor_set_ptrs;
    void *ctx;
    const char *arg_names[AC_MAX_ARGS];
    BITSET_DECLARE(user_data, AC_MAX_ARGS);
@@ -114,14 +115,15 @@ add_ud_arg(struct radv_shader_args_state *state, unsigned size, enum ac_arg_type
 static void
 add_descriptor_set(struct radv_shader_args_state *state, uint32_t set)
 {
-   RADV_ADD_ARRAY_ARG(state, AC_ARG_SGPR, 1, AC_ARG_CONST_ADDR, descriptors, set);
+   const unsigned pointer_sgprs = state->full_64bit_descriptor_set_ptrs ? 2 : 1;
+   RADV_ADD_ARRAY_ARG(state, AC_ARG_SGPR, pointer_sgprs, AC_ARG_CONST_ADDR, descriptors, set);
 
    struct radv_userdata_info *ud_info = &state->args->user_sgprs_locs.descriptor_sets[set];
    ud_info->sgpr_idx = state->args->num_user_sgprs;
-   ud_info->num_sgprs = 1;
+   ud_info->num_sgprs = pointer_sgprs;
 
    state->args->user_sgprs_locs.descriptor_sets_enabled |= 1u << set;
-   state->args->num_user_sgprs++;
+   state->args->num_user_sgprs += pointer_sgprs;
 }
 
 static void
@@ -976,6 +978,7 @@ radv_declare_shader_args(const struct radv_compiler_info *compiler_info,
 
    struct radv_shader_args_state state = {
       .args = args,
+      .full_64bit_descriptor_set_ptrs = stage->key.full_64bit_descriptor_set_ptrs,
    };
 
    struct user_sgpr_info user_sgpr_info = {0};
@@ -1004,12 +1007,15 @@ radv_declare_shader_args(const struct radv_compiler_info *compiler_info,
          user_sgpr_info.remaining_sgprs -= RADV_MAX_HEAPS;
       } else {
          const uint32_t num_desc_set = util_bitcount(info->desc_set_used_mask);
+         const uint32_t descriptor_set_sgprs =
+            stage->key.full_64bit_descriptor_set_ptrs ? 2 : 1;
+         const uint32_t direct_descriptor_sgprs = num_desc_set * descriptor_set_sgprs;
 
-         if (info->force_indirect_descriptors || remaining_sgprs < num_desc_set) {
+         if (info->force_indirect_descriptors || remaining_sgprs < direct_descriptor_sgprs) {
             user_sgpr_info.indirect_all_descriptor_sets = true;
             user_sgpr_info.remaining_sgprs--;
          } else {
-            user_sgpr_info.remaining_sgprs -= num_desc_set;
+            user_sgpr_info.remaining_sgprs -= direct_descriptor_sgprs;
          }
       }
 

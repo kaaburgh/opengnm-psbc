@@ -101,7 +101,9 @@ struct radv_shader_stage_key {
    /* Whether the shader is used with indirect pipeline binds. */
    uint8_t indirect_bindable : 1;
 
-   uint32_t reserved : 14;
+   /* Standalone PSBC ABI: descriptor-set pointers occupy a full SGPR pair. */
+   uint32_t full_64bit_descriptor_set_ptrs : 1;
+   uint32_t reserved : 13;
 };
 
 struct radv_ps_epilog_key {

@@ -27,6 +27,7 @@
 #include "ac_nir.h"
 #include "amd_family.h"
 #include "nir/radv_nir.h"
+#include "radv_descriptor_set.h"
 #include "radv_shader.h"
 #include "radv_shader_args.h"
 #include "radv_shader_info.h"
@@ -51,6 +52,90 @@ static mesa_shader_stage psbc_to_mesa_stage(PsbcStage s) {
     case PSBC_STAGE_LOCAL:      return MESA_SHADER_VERTEX;  /* LS is a VS variant */
     default:                    return MESA_SHADER_NONE;
     }
+}
+
+/* === Standalone resource ABI === */
+
+static PsbcResult build_resource_layout(
+    nir_shader* nir, struct radv_shader_layout* layout,
+    struct radv_descriptor_set_layout** owned_set0
+) {
+    bool has_buffers = false;
+    uint32_t max_binding = 0;
+
+    *owned_set0 = NULL;
+
+    nir_foreach_variable_with_modes(var, nir, nir_var_mem_push_const) {
+        return PSBC_RESULT_UNSUPPORTED_PUSH_CONSTANTS;
+    }
+
+    /* Images, samplers and texel buffers are intentionally outside the
+     * standalone resource ABI. UBOs/SSBOs have their own NIR modes. */
+    nir_foreach_variable_with_modes(
+        var, nir, nir_var_uniform | nir_var_image
+    ) {
+        return PSBC_RESULT_UNSUPPORTED_RESOURCE_TYPE;
+    }
+
+    nir_foreach_variable_with_modes(
+        var, nir, nir_var_mem_ubo | nir_var_mem_ssbo
+    ) {
+        if (var->data.descriptor_set != 0) {
+            return PSBC_RESULT_UNSUPPORTED_DESCRIPTOR_SET;
+        }
+        if (glsl_type_is_array(var->type)) {
+            return PSBC_RESULT_UNSUPPORTED_DESCRIPTOR_ARRAY;
+        }
+        if (var->data.binding > UINT32_MAX / 16 - 1) {
+            return PSBC_RESULT_OUT_OF_MEMORY;
+        }
+
+        has_buffers = true;
+        max_binding = MAX2(max_binding, var->data.binding);
+    }
+
+    if (!has_buffers) {
+        return PSBC_RESULT_OK;
+    }
+
+    const size_t binding_count = (size_t)max_binding + 1;
+    if (binding_count >
+        (SIZE_MAX - sizeof(struct radv_descriptor_set_layout)) /
+            sizeof(struct radv_descriptor_set_binding_layout)) {
+        return PSBC_RESULT_OUT_OF_MEMORY;
+    }
+
+    const size_t layout_size =
+        sizeof(struct radv_descriptor_set_layout) +
+        binding_count * sizeof(struct radv_descriptor_set_binding_layout);
+    struct radv_descriptor_set_layout* set0 = calloc(1, layout_size);
+    if (!set0) {
+        return PSBC_RESULT_OUT_OF_MEMORY;
+    }
+
+    set0->binding_count = binding_count;
+    set0->size = binding_count * 16;
+
+    nir_foreach_variable_with_modes(
+        var, nir, nir_var_mem_ubo | nir_var_mem_ssbo
+    ) {
+        struct radv_descriptor_set_binding_layout* binding =
+            &set0->binding[var->data.binding];
+
+        binding->type =
+            var->data.mode == nir_var_mem_ssbo
+                ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+                : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        binding->array_size = 1;
+        binding->offset = var->data.binding * 16;
+        binding->size = 16;
+    }
+
+    layout->num_sets = 1;
+    layout->set[0].layout = set0;
+    layout->set[0].dynamic_offset_start = 0;
+    *owned_set0 = set0;
+    return PSBC_RESULT_OK;
 }
 
 /* === Init/shutdown (refcounted) === */
@@ -696,10 +781,16 @@ static PsbcResult buildshaderbinary(
     if (ctx->rargs->descriptors[0].used) {
         const GnmInputUsageSlot s = {
             .usagetype = GNM_SHINPUTUSAGE_PTR_INDIRECTRESOURCETABLE,
+            .apislot = 0,
             .startregister =
                 ctx->rargs->ac
                     .args[ctx->rargs->descriptors[0].arg_index]
                     .offset,
+            /* Pointer usage types define their own width; the flag byte
+             * remains zero rather than describing a 4/8-DWORD resource. */
+            .registercount = 0,
+            .resourcetype = 0,
+            .chunkmask = 0,
         };
         memcpy(buf + offset, &s, sizeof(s));
         offset += sizeof(s);
@@ -1019,10 +1110,23 @@ PsbcResult psbc_compile_shader(
     nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
     radv_nir_lower_io(nir);
 
+    /* Build the minimal standalone descriptor layout before RADV gathers
+     * shader info or declares user SGPR arguments. radv_postprocess_nir()
+     * consumes stage.layout when lowering descriptors. */
+    struct radv_shader_layout layout = {0};
+    struct radv_descriptor_set_layout* owned_set0 = NULL;
+    PsbcResult resource_result =
+        build_resource_layout(nir, &layout, &owned_set0);
+    if (resource_result != PSBC_RESULT_OK) {
+        psbc_shutdown();
+        return resource_result;
+    }
+    stage.layout = layout;
+    stage.key.full_64bit_descriptor_set_ptrs = owned_set0 != NULL;
+
     /* Shader info + args + postprocess */
     radv_nir_shader_info_init(stage.stage, stage.next_stage, &stage.info);
 
-    struct radv_shader_layout layout = {0};
     struct radv_graphics_state_key gfx_state = {0};
     gfx_state.ps.epilog.spi_shader_col_format = V_028714_SPI_SHADER_FP16_ABGR;
     gfx_state.ps.epilog.color_is_int8 = 0xff;
@@ -1032,6 +1136,28 @@ PsbcResult psbc_compile_shader(
         &compiler_info, nir, &layout, &stage.key, &gfx_state,
         RADV_PIPELINE_GRAPHICS, false, &stage.info
     );
+
+    if (stage.info.desc_set_used_mask & ~1u) {
+        free(owned_set0);
+        psbc_shutdown();
+        return PSBC_RESULT_UNSUPPORTED_DESCRIPTOR_SET;
+    }
+    if (stage.info.loads_push_constants) {
+        free(owned_set0);
+        psbc_shutdown();
+        return PSBC_RESULT_UNSUPPORTED_PUSH_CONSTANTS;
+    }
+    if (stage.info.loads_dynamic_offsets ||
+        stage.info.loads_dynamic_descriptors_offset_addr) {
+        free(owned_set0);
+        psbc_shutdown();
+        return PSBC_RESULT_UNSUPPORTED_DYNAMIC_BUFFER;
+    }
+    if (mesa_stage == MESA_SHADER_COMPUTE && stage.info.cs.uses_grid_size) {
+        free(owned_set0);
+        psbc_shutdown();
+        return PSBC_RESULT_UNSUPPORTED_NUM_WORKGROUPS;
+    }
 
     /* Determine previous stage for shader args declaration.
      * HS/GS need previous_stage=VERTEX so that the merged-pipeline args
@@ -1049,6 +1175,19 @@ PsbcResult psbc_compile_shader(
     radv_declare_shader_args(
         &compiler_info, &gfx_state, &stage, previous_stage, NULL
     );
+
+    /* RADV falls back to an indirect table of one-SGPR set pointers when the
+     * direct sets do not fit in user SGPRs. That is a different guest ABI;
+     * reject it rather than emitting it. */
+    if (owned_set0) {
+        const struct ac_arg set0_arg = stage.args.descriptors[0];
+        if (!set0_arg.used ||
+            stage.args.ac.args[set0_arg.arg_index].size != 2) {
+            free(owned_set0);
+            psbc_shutdown();
+            return PSBC_RESULT_UNSUPPORTED_USER_SGPRS;
+        }
+    }
 
     stage.nir = nir;
     stage.info.user_sgprs_locs = stage.args.user_sgprs_locs;
@@ -1090,8 +1229,16 @@ PsbcResult psbc_compile_shader(
     );
 
     if (!binary) {
+        free(owned_set0);
         psbc_shutdown();
         return PSBC_RESULT_COMPILE_ACO;
+    }
+
+    if (binary->config.scratch_bytes_per_wave > 0) {
+        free(binary);
+        free(owned_set0);
+        psbc_shutdown();
+        return PSBC_RESULT_UNSUPPORTED_SCRATCH;
     }
 
     /* Extract code from radv_shader_binary_legacy */
@@ -1127,6 +1274,7 @@ PsbcResult psbc_compile_shader(
     out->size = output_size;
 
     free(binary);
+    free(owned_set0);
     psbc_shutdown();
 
     return result;
@@ -1147,6 +1295,22 @@ const char* psbc_result_string(PsbcResult result) {
     case PSBC_RESULT_UNSUPPORTED_STAGE: return "unsupported shader stage";
     case PSBC_RESULT_COMPILE_NIR:      return "SPIR-V to NIR compilation failed";
     case PSBC_RESULT_COMPILE_ACO:      return "ACO shader compilation failed";
+    case PSBC_RESULT_UNSUPPORTED_DESCRIPTOR_SET:
+        return "standalone resource ABI supports descriptor set 0 only";
+    case PSBC_RESULT_UNSUPPORTED_DESCRIPTOR_ARRAY:
+        return "standalone resource ABI does not support descriptor arrays";
+    case PSBC_RESULT_UNSUPPORTED_RESOURCE_TYPE:
+        return "standalone resource ABI supports UBO/SSBO buffers only";
+    case PSBC_RESULT_UNSUPPORTED_PUSH_CONSTANTS:
+        return "standalone resource ABI does not support push constants";
+    case PSBC_RESULT_UNSUPPORTED_DYNAMIC_BUFFER:
+        return "standalone resource ABI does not support dynamic buffers";
+    case PSBC_RESULT_UNSUPPORTED_NUM_WORKGROUPS:
+        return "standalone resource ABI does not support gl_NumWorkGroups";
+    case PSBC_RESULT_UNSUPPORTED_SCRATCH:
+        return "standalone resource ABI does not support scratch-using shaders";
+    case PSBC_RESULT_UNSUPPORTED_USER_SGPRS:
+        return "standalone resource ABI could not place the 64-bit descriptor-table pointer in user SGPRs";
     case PSBC_RESULT_OUT_OF_MEMORY:    return "out of memory";
     case PSBC_RESULT_INTERNAL_ERROR:   return "internal error";
     default:                           return "unknown error";

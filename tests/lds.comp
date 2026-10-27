@@ -1,0 +1,17 @@
+#version 450
+
+// Workgroup shared memory (LDS). Each invocation writes one word and reads its
+// neighbour's after the barrier.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Out {
+    uint o[];
+} outb;
+
+shared uint lds[64];
+
+void main() {
+    lds[gl_LocalInvocationIndex] = gl_GlobalInvocationID.x * 3u;
+    barrier();
+    outb.o[gl_GlobalInvocationID.x] = lds[(gl_LocalInvocationIndex + 1u) & 63u];
+}

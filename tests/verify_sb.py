@@ -23,6 +23,13 @@ PSSL_HEADER_SIZE = 0x24
 GNM_FILE_HEADER_SIZE = 0x10
 GNM_BINARY_INFO_SIZE = 0x1C  # GnmShaderBinaryInfo
 
+# GnmCsShader: GnmShaderCommonData (8 bytes), then computepgmlo,
+# computepgmhi, computepgmrsrc1, computepgmrsrc2, ...
+GNM_CS_RSRC2_OFFSET = PSSL_HEADER_SIZE + GNM_FILE_HEADER_SIZE + 8 + 3 * 4
+
+# opengnm-psbc target flags, and the name each target's output gets.
+TARGETS = (("-4", "ps4"), ("-n", "neo"), ("-g", "ps5"))
+
 # PS4-specific CRC32 table (same as standard CRC32/IEEE table)
 CRC32_TABLE = [
     0x00000000, 0x77073096, 0xee0e612c, 0x990951ba, 0x076dc419, 0x706af48f,
@@ -221,6 +228,21 @@ def verify_shader(sb_path, expected_type):
     print(f"\n✓ All structural checks PASSED for {sb_path}")
     return True
 
+def verify_cs_lds(sb_path, expected_blocks):
+    """Check COMPUTE_PGM_RSRC2.LDS_SIZE (bits 15-23, in 512-byte blocks)."""
+    with open(sb_path, "rb") as f:
+        data = f.read()
+
+    rsrc2 = read_u32_le(data, GNM_CS_RSRC2_OFFSET)
+    lds_blocks = (rsrc2 >> 15) & 0x1ff
+    if lds_blocks != expected_blocks:
+        print(f"  ✗ {sb_path}: COMPUTE_PGM_RSRC2=0x{rsrc2:08x} LDS_SIZE={lds_blocks} "
+              f"(expected {expected_blocks})")
+        return False
+    print(f"  ✓ {sb_path}: COMPUTE_PGM_RSRC2.LDS_SIZE={lds_blocks} "
+          f"({lds_blocks * 512} bytes)")
+    return True
+
 def main():
     # Build shaders if needed
     vert_spv = os.path.join(TESTS, "tri.vert.spv")
@@ -335,6 +357,31 @@ def main():
         sys.exit(1)
     print(r.stdout.strip())
 
+    # Compile the LDS compute shaders for every target. LDS_SIZE is the
+    # shader's shared memory rounded up to the target's LDS allocation
+    # granularity (512 bytes on GFX7/GFX8, 1024 bytes on GFX10.3), in
+    # 512-byte blocks: 256 bytes for lds.comp, 64 KiB for lds_max.comp.
+    lds_expected = {
+        "lds": {"ps4": 1, "neo": 1, "ps5": 2},
+        "lds_max": {"ps4": 128, "neo": 128, "ps5": 128},
+    }
+    lds_sbs = []
+    for name, expected in lds_expected.items():
+        lds_glsl = os.path.join(TESTS, f"{name}.comp")
+        lds_spv = os.path.join(TESTS, f"{name}.comp.spv")
+        if not os.path.exists(lds_spv):
+            subprocess.run(["glslangValidator", "-V", lds_glsl, "-o", lds_spv], check=True)
+        for flag, target in TARGETS:
+            lds_sb = os.path.join(TESTS, f"{name}.{target}.sb")
+            print(f"Compiling LDS compute shader {name} ({target})...")
+            r = subprocess.run([psbc_bin, flag, "-f", lds_spv, "-o", lds_sb, "-s", "compute", "-vv"],
+                               capture_output=True, text=True, cwd=PSBC)
+            if r.returncode != 0:
+                print(f"LDS compute compile failed ({name}, {target}): {r.stderr}")
+                sys.exit(1)
+            print(r.stdout.strip())
+            lds_sbs.append((lds_sb, expected[target]))
+
     # Verify
     ok = True
     ok &= verify_shader(vert_sb, GNM_SHADER_VERTEX)
@@ -345,6 +392,10 @@ def main():
     ok &= verify_shader(tese_sb, GNM_SHADER_VERTEX)  # DS uses VS type
     ok &= verify_shader(es_sb, GNM_SHADER_VERTEX)    # ES is a VS variant
     ok &= verify_shader(ls_sb, GNM_SHADER_VERTEX)    # LS is a VS variant
+    ok &= verify_cs_lds(comp_sb, 0)                  # no shared memory
+    for lds_sb, blocks in lds_sbs:
+        ok &= verify_shader(lds_sb, GNM_SHADER_COMPUTE)
+        ok &= verify_cs_lds(lds_sb, blocks)
 
     if ok:
         print("\n=== ALL TESTS PASSED ===")

@@ -1,0 +1,18 @@
+#version 450
+
+// The largest LDS allocation a workgroup can have: 64 KiB on every target.
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) buffer Out {
+    uint o[];
+} outb;
+
+shared uint lds[16384];
+
+void main() {
+    uint i = gl_LocalInvocationIndex;
+    lds[i] = i;
+    lds[16383u - i] = i * 7u;
+    barrier();
+    outb.o[gl_GlobalInvocationID.x] = lds[i] + lds[16320u + i];
+}

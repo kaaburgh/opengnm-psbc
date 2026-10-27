@@ -993,6 +993,15 @@ static void setup_ac_info(struct ac_compiler_info* ac_info, enum amd_gfx_level g
         ac_info->max_vgpr_alloc = 64;
         ac_info->wave64_vgpr_alloc_granularity = 4;
     }
+
+    /* A workgroup can allocate up to 64 KiB of LDS on every target: GFX7+
+     * has 64 KiB per CU, and GFX10.3 has 128 KiB per WGP but caps a
+     * workgroup at 64 KiB. radv_postprocess_binary_config() checks the
+     * shader's LDS against this before encoding it into the *_RSRC2
+     * LDS_SIZE field. The allocation and encoding granularities come from
+     * gfx_level (ac_shader_get_lds_alloc_granularity and
+     * ac_shader_encode_lds_size), not from this struct. */
+    ac_info->lds_size_per_workgroup = 64 * 1024;
 }
 
 static void setup_target(PsbcTarget target,

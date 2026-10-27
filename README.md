@@ -28,7 +28,9 @@ The PS5 GPU is RDNA2 (GFX10.3). Legacy PS4 (GFX7) and PS4 Pro
   `vulkan-ps4` ICD for runtime shader compilation on PS4
 - OpenOrbis cross-compilation support (`libpsbc.orbis.a`, 477 objects)
 - Automated test suite (`tests/verify_sb.py`) verifies shader binary
-  structure (PSSL header, GNM magic, CRC32) for all 8 shader stages
+  structure (PSSL header, GNM magic, CRC32) for all 8 shader stages, and
+  the compute LDS allocation (`COMPUTE_PGM_RSRC2.LDS_SIZE`) for all three
+  targets
 - **Hardware validated**: VS+PS shaders render correctly on a real PS4
   (FW 9.00, GFX7) — confirmed via `sceGnmSetVsShader` / `sceGnmSetPsShader`
   with 600 frames of triangle rendering at 60fps

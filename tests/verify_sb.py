@@ -357,11 +357,13 @@ def main():
         sys.exit(1)
     print(r.stdout.strip())
 
-    # Compile the LDS compute shaders for every target. LDS_SIZE is the
-    # shader's shared memory rounded up to the target's LDS allocation
-    # granularity (512 bytes on GFX7/GFX8, 1024 bytes on GFX10.3), in
-    # 512-byte blocks: 256 bytes for lds.comp, 64 KiB for lds_max.comp.
+    # Compile the compute shaders for every target and check their LDS
+    # allocation. LDS_SIZE is the shader's shared memory rounded up to the
+    # target's LDS allocation granularity (512 bytes on GFX7/GFX8, 1024 bytes
+    # on GFX10.3), in 512-byte blocks: none for test.comp, 256 bytes for
+    # lds.comp, 64 KiB for lds_max.comp.
     lds_expected = {
+        "test": {"ps4": 0, "neo": 0, "ps5": 0},
         "lds": {"ps4": 1, "neo": 1, "ps5": 2},
         "lds_max": {"ps4": 128, "neo": 128, "ps5": 128},
     }
@@ -373,11 +375,11 @@ def main():
             subprocess.run(["glslangValidator", "-V", lds_glsl, "-o", lds_spv], check=True)
         for flag, target in TARGETS:
             lds_sb = os.path.join(TESTS, f"{name}.{target}.sb")
-            print(f"Compiling LDS compute shader {name} ({target})...")
+            print(f"Compiling compute shader {name} ({target})...")
             r = subprocess.run([psbc_bin, flag, "-f", lds_spv, "-o", lds_sb, "-s", "compute", "-vv"],
                                capture_output=True, text=True, cwd=PSBC)
             if r.returncode != 0:
-                print(f"LDS compute compile failed ({name}, {target}): {r.stderr}")
+                print(f"Compute compile failed ({name}, {target}): {r.stderr}")
                 sys.exit(1)
             print(r.stdout.strip())
             lds_sbs.append((lds_sb, expected[target]))
@@ -392,7 +394,6 @@ def main():
     ok &= verify_shader(tese_sb, GNM_SHADER_VERTEX)  # DS uses VS type
     ok &= verify_shader(es_sb, GNM_SHADER_VERTEX)    # ES is a VS variant
     ok &= verify_shader(ls_sb, GNM_SHADER_VERTEX)    # LS is a VS variant
-    ok &= verify_cs_lds(comp_sb, 0)                  # no shared memory
     for lds_sb, blocks in lds_sbs:
         ok &= verify_shader(lds_sb, GNM_SHADER_COMPUTE)
         ok &= verify_cs_lds(lds_sb, blocks)

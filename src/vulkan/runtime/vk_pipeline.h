@@ -24,9 +24,14 @@ vk_set_subgroup_size(nir_shader *shader,
                      bool allow_varying,
                      bool require_full)
 {
-   (void)shader; (void)subgroup_size; (void)min_subgroup_size;
-   (void)max_subgroup_size; (void)spirv_version; (void)info_pNext;
+   (void)subgroup_size; (void)spirv_version; (void)info_pNext;
    (void)allow_varying; (void)require_full;
+   /* A target with a single wave size runs every shader at it. GFX6-9 only have wave64, and
+    * radv_shader_choose_subgroup_size() would otherwise pick wave32 for small workgroups. */
+   if (min_subgroup_size != 0 && min_subgroup_size == max_subgroup_size) {
+      shader->info.min_subgroup_size = min_subgroup_size;
+      shader->info.max_subgroup_size = max_subgroup_size;
+   }
 }
 
 #endif

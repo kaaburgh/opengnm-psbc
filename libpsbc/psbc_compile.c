@@ -944,55 +944,49 @@ static PsbcResult buildshaderbinary(
 static void setup_ac_info(struct ac_compiler_info* ac_info, enum amd_gfx_level gfxlevel) {
     ac_info->gfx_level = gfxlevel;
 
+    /* Register and LDS limits follow ac_fill_compiler_info() for the generation. ACO spills
+     * past them, and a workgroup's LDS must fit in lds_size_per_workgroup. */
     if (gfxlevel >= GFX10_3) {
         ac_info->max_waves_per_simd = 16;
-        ac_info->num_physical_sgprs_per_simd = 128 * 16;
-        ac_info->num_physical_wave64_vgprs_per_simd = 256;
-        ac_info->num_simd_per_compute_unit = 2;
-        ac_info->min_sgpr_alloc = 1;
-        ac_info->max_sgpr_alloc = 128;
-        ac_info->sgpr_alloc_granularity = 1;
-        ac_info->min_wave64_vgpr_alloc = 4;
-        ac_info->max_vgpr_alloc = 256;
-        ac_info->wave64_vgpr_alloc_granularity = 4;
-        ac_info->has_packed_math_16bit = true;
-        ac_info->has_fma_mix = true;
     } else if (gfxlevel == GFX10) {
         ac_info->max_waves_per_simd = 20;
-        ac_info->num_physical_sgprs_per_simd = 128 * 20;
-        ac_info->num_physical_wave64_vgprs_per_simd = 256;
-        ac_info->num_simd_per_compute_unit = 2;
-        ac_info->min_sgpr_alloc = 1;
-        ac_info->max_sgpr_alloc = 128;
-        ac_info->sgpr_alloc_granularity = 1;
-        ac_info->min_wave64_vgpr_alloc = 4;
-        ac_info->max_vgpr_alloc = 256;
-        ac_info->wave64_vgpr_alloc_granularity = 4;
-        ac_info->has_packed_math_16bit = true;
-    } else if (gfxlevel == GFX8) {
+    } else {
         ac_info->max_waves_per_simd = 10;
-        ac_info->num_physical_sgprs_per_simd = 16 * 10;
-        ac_info->num_physical_wave64_vgprs_per_simd = 128;
-        ac_info->num_simd_per_compute_unit = 1;
-        ac_info->min_sgpr_alloc = 1;
-        ac_info->max_sgpr_alloc = 16;
-        ac_info->sgpr_alloc_granularity = 1;
-        ac_info->min_wave64_vgpr_alloc = 4;
-        ac_info->max_vgpr_alloc = 128;
-        ac_info->wave64_vgpr_alloc_granularity = 4;
+    }
+    if (gfxlevel >= GFX10) {
+        /* Includes VCC, which can be treated as s[106-107]. */
+        ac_info->num_physical_sgprs_per_simd = 108 * ac_info->max_waves_per_simd;
+        ac_info->min_sgpr_alloc = 108;
+        ac_info->max_sgpr_alloc = 108;
+        ac_info->sgpr_alloc_granularity = 108;
+        ac_info->num_physical_wave64_vgprs_per_simd = 512;
+        ac_info->num_simd_per_compute_unit = 2;
+    } else if (gfxlevel == GFX8) {
+        ac_info->num_physical_sgprs_per_simd = 800;
+        ac_info->min_sgpr_alloc = 16;
+        ac_info->max_sgpr_alloc = 102;
+        ac_info->sgpr_alloc_granularity = 16;
+        ac_info->num_physical_wave64_vgprs_per_simd = 256;
+        ac_info->num_simd_per_compute_unit = 4;
     } else {
         /* GFX7 */
-        ac_info->max_waves_per_simd = 10;
-        ac_info->num_physical_sgprs_per_simd = 12 * 10;
-        ac_info->num_physical_wave64_vgprs_per_simd = 64;
-        ac_info->num_simd_per_compute_unit = 1;
-        ac_info->min_sgpr_alloc = 1;
-        ac_info->max_sgpr_alloc = 12;
-        ac_info->sgpr_alloc_granularity = 1;
-        ac_info->min_wave64_vgpr_alloc = 4;
-        ac_info->max_vgpr_alloc = 64;
-        ac_info->wave64_vgpr_alloc_granularity = 4;
+        ac_info->num_physical_sgprs_per_simd = 512;
+        ac_info->min_sgpr_alloc = 8;
+        ac_info->max_sgpr_alloc = 104;
+        ac_info->sgpr_alloc_granularity = 8;
+        ac_info->num_physical_wave64_vgprs_per_simd = 256;
+        ac_info->num_simd_per_compute_unit = 4;
     }
+    ac_info->wave64_vgpr_alloc_granularity =
+        gfxlevel >= GFX10_3 ? ac_info->num_physical_wave64_vgprs_per_simd / 64 : 4;
+    ac_info->min_wave64_vgpr_alloc = ac_info->wave64_vgpr_alloc_granularity;
+    ac_info->max_vgpr_alloc = 256;
+    ac_info->lds_size_per_workgroup = 64 * 1024;
+
+    ac_info->has_packed_math_16bit = gfxlevel >= GFX10;
+    ac_info->has_fma_mix = gfxlevel >= GFX10_3;
+    /* RDNA1/2 buffer descriptors need RESOURCE_LEVEL=1, including the ones ACO builds. */
+    ac_info->has_desc_resource_level = gfxlevel >= GFX10 && gfxlevel < GFX11;
 }
 
 static void setup_target(PsbcTarget target,
@@ -1061,6 +1055,10 @@ PsbcResult psbc_compile_shader(
     compiler_info.key.ps_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
     compiler_info.key.cs_wave_size = (gfxlevel >= GFX10_3) ? 32 : 64;
     compiler_info.key.rt_wave_size = 64;
+    /* As radv reports it: GFX6-9 only run wave64. */
+    compiler_info.subgroup_size = 64;
+    compiler_info.min_subgroup_size = (gfxlevel >= GFX10) ? 32 : 64;
+    compiler_info.max_subgroup_size = 64;
     compiler_info.key.family = chipfamily;
     compiler_info.key.load_grid_size_from_user_sgpr = (gfxlevel >= GFX10_3);
     /* ACO uses debug.family for disassembly and init_program assertion */

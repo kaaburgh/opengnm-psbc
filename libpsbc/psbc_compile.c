@@ -985,6 +985,8 @@ static void setup_ac_info(struct ac_compiler_info* ac_info, enum amd_gfx_level g
 
     ac_info->has_packed_math_16bit = gfxlevel >= GFX10;
     ac_info->has_fma_mix = gfxlevel >= GFX10_3;
+    /* RDNA1/2 buffer descriptors need RESOURCE_LEVEL=1, including the ones ACO builds. */
+    ac_info->has_desc_resource_level = gfxlevel >= GFX10 && gfxlevel < GFX11;
 }
 
 static void setup_target(PsbcTarget target,
